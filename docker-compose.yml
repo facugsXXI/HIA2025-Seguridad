@@ -1,0 +1,67 @@
+services:
+  secure-proxy:
+    image: nginx:alpine
+    container_name: secure-proxy
+    ports:
+      - "8080:80"
+    volumes:
+      - ./proxy/conf:/etc/nginx/conf.d
+      - ./proxy/htpasswd/.htpasswd:/etc/nginx/.htpasswd
+      - ./proxy/nginx.conf:/etc/nginx/nginx.conf
+    networks:
+      - public
+      - intranet
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: phpmyadmin
+    environment:
+      - PMA_HOST=mysql
+      - PMA_PORT=3306
+      - PMA_USER=root
+      - PMA_PASSWORD=rootpass
+    expose:
+      - "80"
+    networks:
+      - intranet
+
+  adminer:
+    image: adminer:latest
+    restart: always
+    expose:
+      - "8080"
+    networks:
+      - intranet
+
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: jira_db
+      MYSQL_USER: jira_user
+      MYSQL_PASSWORD: jira_pass
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - intranet
+
+  localxpose:
+    image: localxpose/localxpose:latest
+    container_name: localxpose
+    environment:
+      - LX_ACCESS_TOKEN=${LX_ACCESS_TOKEN}
+    command: tunnel http --to secure-proxy:80
+    networks:
+      - public
+    depends_on:
+      - secure-proxy
+
+volumes:
+  mysql_data:
+
+networks:
+  public:
+  intranet:
