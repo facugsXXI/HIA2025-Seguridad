@@ -1,67 +1,294 @@
-services:
-  secure-proxy:
-    image: nginx:alpine
-    container_name: secure-proxy
-    ports:
-      - "8080:80"
-    volumes:
-      - ./proxy/conf:/etc/nginx/conf.d
-      - ./proxy/htpasswd/.htpasswd:/etc/nginx/.htpasswd
-      - ./proxy/nginx.conf:/etc/nginx/nginx.conf
-    networks:
-      - public
-      - intranet
+version: '3.8'
 
+## Docker compose de comfiguracion. La idea es 1 servicio = 1 contenedor
+services:
+  # MySQL Master para replicación
+  mysql_master:
+    image: mysql:8.0
+    container_name: mysql_master
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - ./mysql-master/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+      - mysql_master_data:/var/lib/mysql
+      - ./init-scripts/01-master-setup.sql:/docker-entrypoint-initdb.d/01-master-setup.sql:ro
+    ports:
+      - "3306:3306"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MySQL Slave para replicación
+  mysql_slave:
+    image: mysql:8.0
+    container_name: mysql_slave
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - ./mysql-slave/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+      - mysql_slave_data:/var/lib/mysql
+      - ./init-scripts/02-slave-setup.sql:/docker-entrypoint-initdb.d/01-slave-setup.sql:ro
+      - ./init-scripts/setup-replication.sh:/docker-entrypoint-initdb.d/02-replication.sh:ro
+    ports:
+      - "3307:3306"
+    depends_on:
+      - mysql_master
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+  # Servidor GLPI
+  glpi:
+    image: glpi/glpi:latest
+    container_name: glpi_app
+    restart: unless-stopped
+    environment:
+      GLPI_DB_HOST: mysql_master
+      GLPI_DB_NAME: glpi
+      GLPI_DB_USER: app_user
+      GLPI_DB_PASSWORD: userpassword
+      GLPI_DB_PORT: 3306
+    ports:
+      - "8081:80"
+    volumes:
+      - glpi_data:/var/glpi
+      - glpi_plugins:/var/glpi/plugins
+    depends_on:
+      - mysql_master
+    networks:
+      - app-network
+
+  # Jira
+  Jira:
+    image: atlassian/jira-software:latest
+    container_name: jira_app
+    restart: unless-stopped
+    environment:
+      - ATL_JDBC_URL=jdbc:mysql://mysql_master:3306/jiradb?useUnicode=true&characterEncoding=UTF8&useSSL=false&allowPublicKeyRetrieval=true
+      - ATL_JDBC_USER=app_user
+      - ATL_JDBC_PASSWORD=userpassword
+    ports:
+      - "8080:8080"
+    volumes:
+      - jira_data:/var/atlassian/application-data/jira
+      - ./mysql-connector-j-8.0.33.jar:/opt/atlassian/jira/lib/mysql-connector-java-8.0.33.jar:ro
+    depends_on:
+      - mysql_master
+    networks:
+      - app-network
+
+  # PHPMyAdmin para gestionar la base de datos MySQL
   phpmyadmin:
     image: phpmyadmin/phpmyadmin:latest
     container_name: phpmyadmin
+    restart: unless-stopped
     environment:
-      - PMA_HOST=mysql
-      - PMA_PORT=3306
-      - PMA_USER=root
-      - PMA_PASSWORD=rootpass
-    expose:
-      - "80"
+      PMA_HOST: mysql_master
+      PMA_PORT: 3306
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "8082:80"
+    depends_on:
+      - mysql_master
     networks:
-      - intranet
+      - app-network
 
-  adminer:
-    image: adminer:latest
-    restart: always
-    expose:
-      - "8080"
+  # Backend API (Clinica-backend)
+  backend:
+    build:
+      context: ../backend/Clinica-backend
+      dockerfile: Dockerfile
+    container_name: clinica_backend
+    restart: unless-stopped
+    env_file:
+      - ../backend/Clinica-backend/.env
+    ports:
+      - "4000:4000"
+    depends_on:
+      - mysql_master
     networks:
-      - intranet
+      - app-network
 
+  # Frontend (Clinica-frontend)
+  frontend:
+    build:
+      context: ../frontend/Clinica-frontend
+      dockerfile: Dockerfile
+    container_name: clinica_frontend
+    restart: unless-stopped
+    ports:
+      - "8083:80"
+    depends_on:
+      - backend
+    networks:
+      - app-network
 
-  mysql:
-    image: mysql:8.0
-    container_name: mysql
-    restart: always
-    environment:
-      MYSQL_ROOT_PASSWORD: rootpass
-      MYSQL_DATABASE: jira_db
-      MYSQL_USER: jira_user
-      MYSQL_PASSWORD: jira_pass
+# PROMETHEUS - MONITOREO
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
     volumes:
-      - mysql_data:/var/lib/mysql
+      - prometheus_data:/prometheus
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
     networks:
-      - intranet
+      - app-network
+    restart: unless-stopped
 
+  # GRAFANA - DASHBOARDS
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/dashboards/provider.yml:/etc/grafana/provisioning/dashboards/provider.yml
+      - ./grafana/dashboards/clinica-dashboard.json:/etc/grafana/provisioning/dashboards/clinica-dashboard.json
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # MYSQL EXPORTER (para métricas de MySQL)
+  mysql-exporter:
+    image: prom/mysqld-exporter:v0.16.0
+    container_name: mysql_exporter
+    # Usar .my.cnf montado para credenciales (evita problemas de parsing del DSN)
+    volumes:
+      - ./mysql-exporter/.my.cnf:/etc/.my.cnf:ro
+    command:
+      - "--config.my-cnf=/etc/.my.cnf"
+      - "--web.listen-address=:9104"
+    ports:
+      - "9104:9104"
+    depends_on:
+      - mysql_master
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # CADVISOR (métricas de contenedores)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    ports:
+      - "8086:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # FAILOVER MONITOR - MONITOREO Y PROMOCIÓN AUTOMÁTICA DEL SLAVE
+  failover-monitor:
+    image: mysql:8.0
+    container_name: failover_monitor
+    entrypoint: /bin/bash
+    command: -c "sleep 10 && /scripts/failover-monitor.sh"
+    volumes:
+      - ./failover-monitor.sh:/scripts/failover-monitor.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - mysql_master
+      - mysql_slave
+    networks:
+      - app-network
+    restart: unless-stopped
+    environment:
+      - PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+  # SECURE PROXY - NGINX
+  secure-proxy:
+    image: nginx:alpine
+    container_name: secure-proxy
+    restart: unless-stopped
+    ports:
+      - "5000:80"   
+    volumes:
+      - ./proxy/conf:/etc/nginx/conf.d
+      - ./proxy/htpasswd:/etc/nginx/.htpasswd
+      - ./proxy/nginx.conf:/etc/nginx/nginx.conf
+    networks:
+      - app-network   
+    depends_on:
+      - frontend      
+      - glpi
+      - Jira
+      - prometheus
+      - cadvisor
+      - phpmyadmin
+      - adminer
+
+  # LOCALXPOSE - TÚNEL HTTPS
   localxpose:
     image: localxpose/localxpose:latest
     container_name: localxpose
+    restart: unless-stopped
     environment:
       - LX_ACCESS_TOKEN=${LX_ACCESS_TOKEN}
     command: tunnel http --to secure-proxy:80
     networks:
-      - public
+      - app-network  
     depends_on:
       - secure-proxy
 
-volumes:
-  mysql_data:
 
+# Volumenes para persistencia de datos
+volumes:
+  mysql_master_data:
+    driver: local
+  mysql_slave_data:
+    driver: local
+  glpi_data:
+    driver: local
+  glpi_plugins:
+    driver: local
+  jira_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  proxysql_data:
+    driver: local
+
+# Red personalizada para los servicios
 networks:
-  public:
-  intranet:
+  app-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
